@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
-import { parseMusicXML, recalculateJianpu, generateDashes } from './utils/parser';
+import React, { useState, useEffect, useMemo } from 'react';
+import { parseMusicXML } from './utils/parser';
+import { recalculateJianpu, generateDashes } from './utils/transforms';
 import { reduceChords } from './utils/chordReducer';
 import { mapNotesToGuqin } from './utils/mapper';
 import { ScoreViewer } from './components/ScoreViewer';
@@ -32,23 +33,26 @@ const App: React.FC = () => {
       });
   }, []);
 
-  // Effect to re-map notes when tuning changes
+  // Tuning-independent pipeline steps (only depend on parsedNotes)
+  const withDashes = useMemo(() => {
+    if (parsedNotes.length === 0) return [];
+    const reduced = reduceChords(parsedNotes);
+    return generateDashes(reduced);
+  }, [parsedNotes]);
+
+  // Effect to re-map notes when tuning changes (or withDashes changes)
   useEffect(() => {
-    if (parsedNotes.length > 0) {
+    if (withDashes.length > 0) {
         const tuning = TUNINGS.find(t => t.id === selectedTuningId) || DEFAULT_TUNING;
-        // 1. Reduce complex chords to guqin-playable (max 2 simultaneous notes)
-        const reduced = reduceChords(parsedNotes);
-        // 2. Generate dashes for long notes and tie continuations (after reduction to avoid duplicates)
-        const withDashes = generateDashes(reduced);
-        // 3. Recalculate jianpu numbers based on the tuning's key
+        // Recalculate jianpu numbers based on the tuning's key
         const recalculated = recalculateJianpu(withDashes, tuning.fifths);
-        // 4. Map to guqin strings/hui positions
+        // Map to guqin strings/hui positions
         const mapped = mapNotesToGuqin(recalculated, tuning.pitches, tuning);
         setGuqinNotes(mapped);
     } else {
         setGuqinNotes([]);
     }
-  }, [parsedNotes, selectedTuningId]);
+  }, [withDashes, selectedTuningId]);
 
   const handleProcess = (xml: string) => {
     setIsProcessing(true);

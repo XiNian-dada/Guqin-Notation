@@ -1,5 +1,14 @@
 import { GuqinTuning } from './types';
 
+/**
+ * Map MusicXML 'fifths' value to a key name.
+ * fifths: number of sharps (+) or flats (-) in key signature.
+ */
+export const FIFTHS_TO_KEY: Record<number, string> = {
+  [-6]: 'Gb', [-5]: 'Db', [-4]: 'Ab', [-3]: 'Eb', [-2]: 'Bb', [-1]: 'F',
+  0: 'C', 1: 'G', 2: 'D', 3: 'A', 4: 'E', 5: 'B', 6: 'F#',
+};
+
 // Pitches are roughly C2 (36) to D3 (50) for Open Strings 1-7 in Standard Tuning (1=F, so 5 6 1 2 3 5 6)
 // Note: Many MIDI files notate Guqin an octave higher (C3-D4). The new mapper handles this via "Solfege Matching".
 export const TUNINGS: GuqinTuning[] = [
@@ -23,7 +32,7 @@ export const TUNINGS: GuqinTuning[] = [
     id: 'ruibin',
     name: '蕤宾 (Ruibin)',
     description: 'Raise 5th String (1=Bb)',
-    solfege: '2 3 5 6 7 2 3',
+    solfege: '2 3 5 6 1 2 3',
     pitches: [36, 38, 41, 43, 46, 48, 50],
     fifths: -2  // Bb Major
   },

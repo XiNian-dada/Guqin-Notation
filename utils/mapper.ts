@@ -57,155 +57,188 @@ interface Position {
   string: number;
   hui: string;
   technique: HandTechnique;
-  score: number; // Lower is better
+  cost: number; // Lower is better
 }
 
-export const mapNotesToGuqin = (notes: ParsedNote[], tuningPitches: number[], tuning?: GuqinTuning): GuqinNote[] => {
-  let lastString = 7; // Default start hint
+/* ─── Sub-functions ──────────────────────────────────────────────────── */
 
-  // Build dynamic solfege map from the actual tuning
+/**
+ * Find open-string (散音) candidates for a given pitch.
+ * Matches by solfege number AND octave proximity to the open string pitch.
+ */
+function findOpenStringCandidates(
+  midi: number,
+  jianpuNum: string,
+  solfegeMap: Record<string, number[]>,
+  tuningPitches: number[],
+  lastString: number,
+): Position[] {
+  const candidates: Position[] = [];
+  const openStringIndices = solfegeMap[jianpuNum];
+  if (!openStringIndices) return candidates;
+
+  for (const strIdx of openStringIndices) {
+    const openMidi = tuningPitches[strIdx - 1];
+    const pitchClassMatch = (midi % 12) === (openMidi % 12);
+    const octaveDiff = Math.abs(midi - openMidi);
+
+    if (pitchClassMatch && octaveDiff <= 12) {
+      const exactMatch = (midi === openMidi) ? 0 : 1;
+      const dist = Math.abs(strIdx - lastString);
+      candidates.push({
+        string: strIdx,
+        hui: '',
+        technique: HandTechnique.San,
+        cost: exactMatch + (dist * 0.1),
+      });
+    }
+  }
+  return candidates;
+}
+
+/**
+ * Find stopped-string (按音) candidates for a given pitch.
+ * Also includes exact open-string matches as backup.
+ */
+function findStoppedCandidates(
+  midi: number,
+  tuningPitches: number[],
+): Position[] {
+  const candidates: Position[] = [];
+
+  for (let index = 0; index < tuningPitches.length; index++) {
+    const openMidi = tuningPitches[index];
+    const stringNum = index + 1;
+
+    // Exact open string (backup to solfege-based Strategy A)
+    if (midi === openMidi) {
+      candidates.push({
+        string: stringNum, hui: '',
+        technique: HandTechnique.San, cost: 0,
+      });
+    }
+
+    // Stopped positions
+    const diff = midi - openMidi;
+    if (diff > 0 && diff <= 24) {
+      let matchedHui = '';
+      let costPenalty = 10; // Stopped notes are "more work" than open strings
+
+      if (HUI_OFFSETS[diff]) {
+        matchedHui = HUI_OFFSETS[diff];
+      } else {
+        // Fuzzy match closest hui
+        const offsets = Object.keys(HUI_OFFSETS).map(Number);
+        const closest = offsets.reduce((prev, curr) =>
+          Math.abs(curr - diff) < Math.abs(prev - diff) ? curr : prev,
+        );
+        if (Math.abs(closest - diff) <= 1) {
+          matchedHui = HUI_OFFSETS[closest];
+          costPenalty += 2; // Slight penalty for fuzzy match
+        }
+      }
+
+      if (matchedHui) {
+        candidates.push({
+          string: stringNum, hui: matchedHui,
+          technique: HandTechnique.An, cost: costPenalty,
+        });
+      }
+    }
+  }
+  return candidates;
+}
+
+/**
+ * Select the best candidate position, filtering out strings already used
+ * in the current chord group.
+ */
+function selectBestCandidate(
+  candidates: Position[],
+  chordUsedStrings: Set<number>,
+): Position {
+  const available = candidates.filter(c => !chordUsedStrings.has(c.string));
+  const pool = available.length > 0 ? available : candidates;
+  pool.sort((a, b) => a.cost - b.cost);
+
+  if (pool.length === 0) {
+    return { string: 7, hui: '外', technique: HandTechnique.An, cost: 999 };
+  }
+  return pool[0];
+}
+
+/**
+ * Assign right-hand and left-hand techniques based on string and hui position.
+ */
+function assignHandTechniques(selected: Position): {
+  rightHand: RightHand;
+  leftHand: LeftHand;
+} {
+  // Strings 1-5 usually Gou (inward), 6-7 usually Tiao (outward)
+  const rightHand = selected.string <= 5 ? RightHand.Gou : RightHand.Tiao;
+
+  let leftHand = LeftHand.None;
+  if (selected.technique === HandTechnique.An) {
+    if (selected.hui.includes('十') || selected.hui === '九') {
+      leftHand = LeftHand.Da;   // Thumb for lower positions
+    } else {
+      leftHand = LeftHand.Ming; // Ring finger for upper positions
+    }
+  }
+
+  return { rightHand, leftHand };
+}
+
+/* ─── Main mapping function ──────────────────────────────────────────── */
+
+export const mapNotesToGuqin = (notes: ParsedNote[], tuningPitches: number[], tuning?: GuqinTuning): GuqinNote[] => {
+  let lastString = 7;
   const activeTuning = tuning || TUNINGS[0];
   const solfegeMap = buildSolfegeMap(activeTuning);
 
   const result: GuqinNote[] = [];
-  let chordUsedStrings: Set<number> = new Set(); // Track strings used in current chord group
+  let chordUsedStrings: Set<number> = new Set();
 
   for (let i = 0; i < notes.length; i++) {
     const note = notes[i];
-    
-    // Reset chord tracking when we hit a non-chord note
-    if (!note.chord) {
-        chordUsedStrings = new Set();
-    }
 
-    // 1. Pass through structural items
+    if (!note.chord) chordUsedStrings = new Set();
+
+    // Pass through structural items unchanged
     if (note.isBarline || note.isDash || note.isRest) {
-        result.push({
-            originalNote: note,
-            string: 0, hui: '', technique: HandTechnique.Empty,
-            rightHand: RightHand.None, leftHand: LeftHand.None, isValid: true
-        });
-        continue;
+      result.push({
+        originalNote: note,
+        string: 0, hui: '', technique: HandTechnique.Empty,
+        rightHand: RightHand.None, leftHand: LeftHand.None, isValid: true,
+      });
+      continue;
     }
 
-    const candidates: Position[] = [];
     const midi = note.absolutePitch;
-    const jianpuNum = note.jianpu.number; // "1", "2", "3"...
+    const jianpuNum = note.jianpu.number;
 
-    // --- STRATEGY A: Open String Match (San Yin) ---
-    // Match by solfege number AND octave proximity to the open string pitch.
-    // The jianpu octave tells us how many octaves away from the "central" range the note is.
-    // Open strings should only match notes whose pitch class matches AND whose octave is
-    // compatible (within ±1 octave of the open string's actual pitch).
-    
-    const openStringIndices = solfegeMap[jianpuNum];
-    
-    if (openStringIndices) {
-        openStringIndices.forEach(strIdx => {
-             const openMidi = tuningPitches[strIdx - 1];
-             // Check if the note's pitch class matches the open string's pitch class
-             // AND the note is within reasonable octave range (octave-equivalent match)
-             const pitchClassMatch = (midi % 12) === (openMidi % 12);
-             const octaveDiff = Math.abs(midi - openMidi);
-             
-             if (pitchClassMatch && octaveDiff <= 12) {
-                 // Exact pitch match gets best score; octave-transposed gets slight penalty
-                 const exactMatch = (midi === openMidi) ? 0 : 1;
-                 const dist = Math.abs(strIdx - lastString);
-                 candidates.push({
-                     string: strIdx,
-                     hui: '',
-                     technique: HandTechnique.San,
-                     score: exactMatch + (dist * 0.1) // Near-exact is excellent
-                 });
-             }
-        });
-    }
+    // Collect candidates from both strategies
+    const candidates: Position[] = [
+      ...findOpenStringCandidates(midi, jianpuNum, solfegeMap, tuningPitches, lastString),
+      ...findStoppedCandidates(midi, tuningPitches),
+    ];
 
-    // --- STRATEGY B: Absolute Pitch Match (Stopped Strings) ---
-    tuningPitches.forEach((openMidi, index) => {
-        const stringNum = index + 1;
-        
-        // Exact Open String (Backup to Strategy A)
-        if (midi === openMidi) {
-             candidates.push({ string: stringNum, hui: '', technique: HandTechnique.San, score: 0 });
-        }
-        
-        // Stopped positions
-        const diff = midi - openMidi;
-        if (diff > 0 && diff <= 24) {
-             // Find Hui
-             let matchedHui = '';
-             let scorePenalty = 10; // Stopped notes are "more work" than open strings for beginner pieces
-             
-             if (HUI_OFFSETS[diff]) {
-                 matchedHui = HUI_OFFSETS[diff];
-             } else {
-                 // Fuzzy match closest hui
-                 // This allows mapping pitches that are slightly off
-                 const offsets = Object.keys(HUI_OFFSETS).map(Number);
-                 const closest = offsets.reduce((prev, curr) => Math.abs(curr - diff) < Math.abs(prev - diff) ? curr : prev);
-                 if (Math.abs(closest - diff) <= 1) {
-                     matchedHui = HUI_OFFSETS[closest];
-                     scorePenalty += 2; // Slight penalty for fuzzy match
-                 }
-             }
-
-             if (matchedHui) {
-                 candidates.push({
-                     string: stringNum,
-                     hui: matchedHui,
-                     technique: HandTechnique.An,
-                     score: scorePenalty
-                 });
-             }
-        }
-    });
-
-    // --- SELECTION ---
-    // Filter out strings already used in current chord group
-    const availableCandidates = candidates.filter(c => !chordUsedStrings.has(c.string));
-    const finalCandidates = availableCandidates.length > 0 ? availableCandidates : candidates;
-    
-    // Sort by Score
-    finalCandidates.sort((a, b) => a.score - b.score);
-
-    // If no candidate (weird pitch), fallback to a dummy "An" on string 7 or 1
-    if (finalCandidates.length === 0) {
-        finalCandidates.push({ string: 7, hui: '外', technique: HandTechnique.An, score: 999 });
-    }
-
-    const selected = finalCandidates[0];
+    const selected = selectBestCandidate(candidates, chordUsedStrings);
     lastString = selected.string;
     chordUsedStrings.add(selected.string);
 
-    // --- HAND LOGIC ---
-    let rh = RightHand.Tiao;
-    // Rule: Strings 1-5 usually Gou (inward), Strings 6-7 usually Tiao (outward) for melody, 
-    // but context matters. For "Xian Weng Cao", it alternates.
-    // Simple heuristic: 
-    if (selected.string <= 5) rh = RightHand.Gou;
-    else rh = RightHand.Tiao;
-    
-    let lh = LeftHand.None;
-    if (selected.technique === HandTechnique.An) {
-        if (selected.hui.includes('十') || selected.hui === '九') {
-            lh = LeftHand.Da; // Thumb for lower positions
-        } else {
-            lh = LeftHand.Ming; // Ring finger for upper positions
-        }
-    }
+    const { rightHand, leftHand } = assignHandTechniques(selected);
 
     result.push({
       originalNote: note,
       string: selected.string,
       hui: selected.hui,
       technique: selected.technique,
-      rightHand: rh,
-      leftHand: lh,
-      isValid: true
+      rightHand,
+      leftHand,
+      isValid: true,
     });
   }
-  
+
   return result;
 };

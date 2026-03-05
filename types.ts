@@ -10,6 +10,7 @@ export interface ParsedNote {
   isBarline?: boolean; // Display as |
   isDash?: boolean;    // Display as - (for duration extension)
   isTied?: boolean;    // This note is a tie continuation (don't re-attack)
+  dashFromTie?: boolean; // This dash was generated from a tied note (for tie arc rendering)
   
   voice: number;
   staff: number;
@@ -18,6 +19,18 @@ export interface ParsedNote {
   absolutePitch: number;
   startTime: number;
   beats?: number;      // Duration in quarter-note beats (for dash generation)
+
+  // Beam grouping — consecutive short notes sharing connected underlines in jianpu
+  beamGroupId?: number;
+
+  // Slur markers — legato arcs in jianpu display (from <slur> elements only)
+  slurStart?: boolean; // A slur begins at this note
+  slurStop?: boolean;  // A slur ends at this note
+
+  // Tie markers — sustain arcs in jianpu display (from <tied> elements only)
+  tieStart?: boolean;  // A tie begins at this note (same pitch sustained forward)
+  tieStop?: boolean;   // A tie ends at this note (same pitch sustained from before)
+
   jianpu: JianpuInfo;
 }
 

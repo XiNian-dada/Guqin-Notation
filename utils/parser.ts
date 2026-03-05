@@ -1,94 +1,6 @@
-import { ParsedNote, JianpuInfo } from '../types';
-import { Note, Key } from 'tonal';
-
-/**
- * Map MusicXML 'fifths' value to a tonal-compatible key name.
- * fifths: number of sharps (+) or flats (-) in key signature.
- */
-const FIFTHS_TO_KEY_NAME: Record<number, string> = {
-  [-6]: 'Gb', [-5]: 'Db', [-4]: 'Ab', [-3]: 'Eb', [-2]: 'Bb', [-1]: 'F',
-  0: 'C', 1: 'G', 2: 'D', 3: 'A', 4: 'E', 5: 'B', 6: 'F#',
-};
-
-// New helper to create structural items
-const createStructureItem = (type: 'bar' | 'dash', startTime: number): ParsedNote => ({
-  step: '', octave: 0, alter: 0, duration: 0, type: '',
-  isRest: false,
-  isBarline: type === 'bar',
-  isDash: type === 'dash',
-  voice: 0, staff: 0, chord: false, pitchName: '', absolutePitch: 0, startTime,
-  jianpu: { number: '', octave: 0, accidental: '', underlineCount: 0, dot: false }
-});
-
-/**
- * Calculate Jianpu (numbered musical notation) info from a MIDI pitch number.
- * Uses `tonal` library for music theory: key resolution, scale degrees, chromaticism.
- */
-const calculateJianpu = (midi: number, fifths: number, isRest: boolean): JianpuInfo => {
-  if (isRest) {
-    return { number: '0', octave: 0, accidental: '', underlineCount: 0, dot: false };
-  }
-
-  // 1. Resolve key from fifths using tonal
-  const keyName = FIFTHS_TO_KEY_NAME[fifths] ?? 'C';
-  const key = Key.majorKey(keyName);
-  const tonicChroma = Note.chroma(key.tonic) ?? 0; // 0-11 pitch class of tonic
-  const scaleNotes = key.scale; // e.g. ['F','G','A','Bb','C','D','E']
-
-  // 2. Determine "Middle 1" — the tonic instance closest to C4 (MIDI 60)
-  let baseTonic = tonicChroma;
-  while (baseTonic < 60) baseTonic += 12;
-  if (Math.abs((baseTonic - 12) - 60) < Math.abs(baseTonic - 60)) {
-    baseTonic -= 12;
-  }
-
-  // 3. Octave relative to baseTonic
-  const diff = midi - baseTonic;
-  const octave = Math.floor(diff / 12);
-
-  // 4. Find scale degree using tonal's chroma matching
-  const notePC = midi % 12; // pitch class of the input note
-  const degreeIndex = scaleNotes.findIndex(n => Note.chroma(n) === notePC);
-
-  let number: string;
-  let accidental = '';
-
-  if (degreeIndex >= 0) {
-    // Diatonic note — directly map to scale degree (1-indexed)
-    number = String(degreeIndex + 1);
-  } else {
-    // Chromatic note — use MusicXML alter to decide # vs b correctly.
-    // Strategy: try both directions, prefer the one that uses the note's
-    // original spelling (sharp vs flat from the XML).
-    // Attempt sharp: check if (notePC - 1) is a scale degree
-    const belowIdx = scaleNotes.findIndex(n => Note.chroma(n) === ((notePC - 1 + 12) % 12));
-    // Attempt flat: check if (notePC + 1) is a scale degree
-    const aboveIdx = scaleNotes.findIndex(n => Note.chroma(n) === ((notePC + 1) % 12));
-
-    if (belowIdx >= 0 && aboveIdx >= 0) {
-      // Both interpretations possible — prefer sharp for common chromatics (#1, #2, #4, #5)
-      // and flat for b3, b6, b7 which are more idiomatic in Chinese music theory
-      const sharpDegree = belowIdx + 1; // e.g. #1, #2, etc.
-      if (sharpDegree <= 2 || sharpDegree === 4 || sharpDegree === 5) {
-        number = String(sharpDegree);
-        accidental = '#';
-      } else {
-        number = String(aboveIdx + 1);
-        accidental = 'b';
-      }
-    } else if (belowIdx >= 0) {
-      number = String(belowIdx + 1);
-      accidental = '#';
-    } else if (aboveIdx >= 0) {
-      number = String(aboveIdx + 1);
-      accidental = 'b';
-    } else {
-      number = '?';
-    }
-  }
-
-  return { number, octave, accidental, underlineCount: 0, dot: false };
-};
+import { ParsedNote } from '../types';
+import { Note } from 'tonal';
+import { createStructureItem, calculateJianpu } from './transforms';
 
 export const parseMusicXML = (xmlContent: string): ParsedNote[] => {
   const parser = new DOMParser();
@@ -102,6 +14,10 @@ export const parseMusicXML = (xmlContent: string): ParsedNote[] => {
   let measureStartTime = 0;
   let currentFifths = 0; // Default to C
   let currentDivisions = 1; // Persist across measures (MusicXML spec: divisions only appears when changed)
+
+  // Beam tracking — assigns sequential IDs to beam groups (level-1 beams).
+  let nextBeamGroupId = 1;
+  let activeBeamGroupId = 0; // 0 = not in a beam group
 
   measures.forEach((measure) => {
     // Get divisions for this measure (update only if present)
@@ -120,6 +36,7 @@ export const parseMusicXML = (xmlContent: string): ParsedNote[] => {
     const children = Array.from(measure.children);
     let currentOffset = 0;
     let maxOffset = 0; // Track the furthest point reached in this measure
+    let previousNoteStartTime = measureStartTime; // Track for chord notes
 
     children.forEach((child) => {
       if (child.tagName === 'note') {
@@ -141,6 +58,23 @@ export const parseMusicXML = (xmlContent: string): ParsedNote[] => {
         // Tie detection: <tie type="stop"/> means this note continues a previous tie
         const ties = Array.from(child.querySelectorAll('tie'));
         const isTieStop = ties.some(t => t.getAttribute('type') === 'stop');
+
+        // Beam detection: <beam number="1">begin|continue|end</beam>
+        // Only track level-1 beams (which define the grouping for jianpu underlines).
+        const beam1 = Array.from(child.querySelectorAll('beam'))
+          .find(b => b.getAttribute('number') === '1');
+        const beam1Type = beam1?.textContent?.trim() ?? '';
+
+        // Slur detection: <notations><slur type="start|stop" /></notations>
+        const slurElements = Array.from(child.querySelectorAll('slur'));
+        const hasSlurStart = slurElements.some(s => s.getAttribute('type') === 'start');
+        const hasSlurStop = slurElements.some(s => s.getAttribute('type') === 'stop');
+
+        // Tied arc detection: <notations><tied type="start|stop" /></notations>
+        // Visual arcs for tied notes (in addition to dashes for note extension)
+        const tiedElements = Array.from(child.querySelectorAll('tied'));
+        const hasTiedStart = tiedElements.some(t => t.getAttribute('type') === 'start');
+        const hasTiedStop = tiedElements.some(t => t.getAttribute('type') === 'stop');
         
         // Only parse voice 1 (right hand / melody).
         // Left hand (voice 5 in piano scores) is skipped — guqin arrangement
@@ -162,6 +96,15 @@ export const parseMusicXML = (xmlContent: string): ParsedNote[] => {
         // Quarters and Halves have 0 underlines
 
         let noteStartTime = measureStartTime + currentOffset;
+        
+        // MusicXML <chord/> means "this note starts at the same time as the
+        // previous note".  Since we already advanced currentOffset for the
+        // previous non-chord note, we must reuse its startTime instead.
+        if (chord) {
+          noteStartTime = previousNoteStartTime;
+        } else {
+          previousNoteStartTime = noteStartTime;
+        }
 
         let noteData: ParsedNote = {
           step: '', octave: 0, alter: 0, duration,
@@ -209,6 +152,24 @@ export const parseMusicXML = (xmlContent: string): ParsedNote[] => {
             noteData.isTied = true;
         }
 
+        // Beam group assignment (only for voice 1 notes that passed the filter).
+        // <beam number="1"> begin/continue/end defines the grouping.
+        if (beam1Type === 'begin') {
+            activeBeamGroupId = nextBeamGroupId++;
+            noteData.beamGroupId = activeBeamGroupId;
+        } else if ((beam1Type === 'continue' || beam1Type === 'end') && activeBeamGroupId > 0) {
+            noteData.beamGroupId = activeBeamGroupId;
+            if (beam1Type === 'end') activeBeamGroupId = 0;
+        }
+
+        // Slur and tie arc markers — produce DIFFERENT visual arcs in jianpu.
+        // <slur> = legato phrasing arc between different pitches (above the line).
+        // <tied> = sustain arc between same-pitch notes (below the line, cross-barline).
+        if (hasSlurStart) noteData.slurStart = true;
+        if (hasSlurStop) noteData.slurStop = true;
+        if (hasTiedStart) noteData.tieStart = true;
+        if (hasTiedStop) noteData.tieStop = true;
+
         notes.push(noteData);
 
         if (!chord) {
@@ -231,85 +192,17 @@ export const parseMusicXML = (xmlContent: string): ParsedNote[] => {
     measureStartTime += maxOffset; 
   });
 
+  // Diagnostic: log what was parsed
+  if (import.meta.env.DEV) {
+    const slurStarts = notes.filter(n => n.slurStart).length;
+    const slurStops = notes.filter(n => n.slurStop).length;
+    const tieStarts = notes.filter(n => n.tieStart).length;
+    const tieStops = notes.filter(n => n.tieStop).length;
+    const tiedNotes = notes.filter(n => n.isTied).length;
+    const beamedNotes = notes.filter(n => n.beamGroupId).length;
+    const beamGroups = new Set(notes.map(n => n.beamGroupId).filter(Boolean)).size;
+    console.log(`[Parser] notes=${notes.length}, slurStart=${slurStarts}, slurStop=${slurStops}, tieStart=${tieStarts}, tieStop=${tieStops}, isTied=${tiedNotes}, beamedNotes=${beamedNotes}, beamGroups=${beamGroups}`);
+  }
+
   return notes;
-};
-
-export const recalculateJianpu = (notes: ParsedNote[], fifths: number): ParsedNote[] => {
-    return notes.map(note => {
-        if (note.isBarline || note.isDash) return note;
-        const j = calculateJianpu(note.absolutePitch, fifths, note.isRest);
-        return {
-            ...note,
-            jianpu: { ...j, underlineCount: note.jianpu.underlineCount, dot: note.jianpu.dot }
-        };
-    });
-};
-
-/**
- * Generate dashes for long notes and tie continuations.
- * 
- * Must be called AFTER chord reduction so that multi-voice parsing
- * doesn't produce duplicate dashes at the same startTime.
- * 
- * Handles chord groups (primary + chord members) as a unit:
- * - Uses the longest note's beats for dash count
- * - All-tied chords become dashes; mixed tied/non-tied keeps only non-tied
- * 
- * Rules:
- * - Tied notes (isTied): replaced entirely with floor(beats) dashes
- * - Long notes (beats >= 2): append floor(beats) - 1 dashes after the note
- */
-export const generateDashes = (notes: ParsedNote[]): ParsedNote[] => {
-    const result: ParsedNote[] = [];
-    let i = 0;
-    while (i < notes.length) {
-        const note = notes[i];
-
-        if (note.isBarline || note.isDash) {
-            result.push(note);
-            i++;
-            continue;
-        }
-
-        // Collect chord group: primary note + consecutive chord members
-        const chordGroup: ParsedNote[] = [note];
-        while (
-            i + 1 < notes.length &&
-            notes[i + 1].chord &&
-            !notes[i + 1].isBarline &&
-            !notes[i + 1].isDash
-        ) {
-            i++;
-            chordGroup.push(notes[i]);
-        }
-
-        const allTied = chordGroup.every(n => n.isTied);
-
-        if (allTied) {
-            // All notes are tie continuations: replace with dashes
-            const maxBeats = Math.max(...chordGroup.map(n => n.beats ?? 0));
-            const totalDashes = Math.max(1, Math.floor(maxBeats));
-            for (let d = 0; d < totalDashes; d++) {
-                result.push(createStructureItem('dash', note.startTime));
-            }
-        } else {
-            // Push non-tied notes in the chord group
-            for (const cn of chordGroup) {
-                if (!cn.isTied) result.push(cn);
-            }
-            // Dashes based on max beats of non-tied notes (whole chord sustains together)
-            const maxBeats = Math.max(
-                ...chordGroup.filter(n => !n.isTied).map(n => n.beats ?? 0)
-            );
-            if (maxBeats >= 2) {
-                const dashCount = Math.floor(maxBeats) - 1;
-                for (let d = 0; d < dashCount; d++) {
-                    result.push(createStructureItem('dash', note.startTime));
-                }
-            }
-        }
-
-        i++;
-    }
-    return result;
 };
